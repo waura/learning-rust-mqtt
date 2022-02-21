@@ -1,5 +1,5 @@
-use std::io::{self, Write};
-use byteorder::WriteBytesExt;
+use std::io::{self, Read, Write, BufRead, BufReader};
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::net::{TcpStream, SocketAddr, IpAddr, Ipv4Addr};
 use std::time::Duration;
 
@@ -31,6 +31,29 @@ impl FixedHeader {
             control_packet_type,
             remaining_length,
         }
+    }
+
+    pub fn read<R: Read>(reader: &mut R) -> Result<FixedHeader, io::Error> {
+        let control_packet_type = reader.read_u8()?;
+        let remaining_length = {
+            let mut cur = 0u32;
+            for i in 0.. {
+                let byte = reader.read_u8()?;
+                cur |= ((byte as u32) & 0x7F) << (7 * i);
+
+                if i >= 4 {
+                    return Result::Err(io::Error::new(io::ErrorKind::InvalidData, "malformed reamining length"));
+                }
+                
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+
+            cur
+        };
+
+        Result::Ok(FixedHeader::new(control_packet_type, remaining_length))
     }
 
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
@@ -127,6 +150,43 @@ impl ConnectPacket {
     }
 }
 
+struct ConnackFlags {
+    session_present: bool,
+}
+
+impl ConnackFlags {
+    fn new(session_present: bool) -> ConnackFlags {
+        ConnackFlags { session_present: false }
+    }
+
+    fn read<R: Read>(reader: &mut R) -> Result<ConnackFlags, io::Error> {
+        let byte = reader.read_u8()?;
+        Ok(ConnackFlags {
+            session_present: byte & 0x1 == 0x1
+        })
+    }
+}
+
+struct ConnackPacket {
+    fixed_header: FixedHeader,
+    flags: ConnackFlags,
+    ret_code: u8,
+}
+
+impl ConnackPacket {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, io::Error> {
+        let fixed_header = FixedHeader::read(reader)?;
+        let flags = ConnackFlags::read(reader)?;
+        let ret_code = reader.read_u8()?;
+
+        Ok(ConnackPacket {
+            fixed_header,
+            flags,
+            ret_code,
+        })
+    }
+}
+
 fn main() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1883);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(30)).expect("failed to connect");
@@ -135,6 +195,12 @@ fn main() {
 
     let connect_packet = ConnectPacket::new("test-client".to_string());
     connect_packet.wirte(&mut stream);
-    
-    println!("Hello, world!");
+
+    let mut reader = BufReader::new(&stream);
+    let result = ConnackPacket::read(&mut reader);
+
+    match &result {
+        Ok(connack_packet) => println!("CONNACK ret code: {}", connack_packet.ret_code),
+        Err(err) => println!("error: {}", err.to_string()),        
+    }
 }
