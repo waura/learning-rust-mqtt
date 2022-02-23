@@ -1,23 +1,26 @@
-use std::io::{self, Read, Write, BufRead, BufReader};
-use byteorder::{ReadBytesExt, WriteBytesExt};
+use std::result::Result;
+use std::io::{self, Read, Write, BufReader};
+use byteorder::{ReadBytesExt, WriteBytesExt, BigEndian};
 use std::net::{TcpStream, SocketAddr, IpAddr, Ipv4Addr};
 use std::time::Duration;
+use log::{debug, error};
 
 const CONNECT:     u8 = 1;
 const CONNACK:     u8 = 2;
-const PUBLISH:     u8 = 3;
-const PUBACK:      u8 = 4;
-const PUBREC:      u8 = 5;
-const PUBREL:      u8 = 6;
-const PUBCOMP:     u8 = 7;
-const SUBSCRIBE:   u8 = 8;
-const SUBACK:      u8 = 9;
-const UNSUBSCRIBE: u8 = 10;
-const UNSUBACK:    u8 = 11;
-const PINGREQ:     u8 = 12;
-const PINGRESP:    u8 = 13;
-const DISCONNECT:  u8 = 14;
+// const PUBLISH:     u8 = 3;
+// const PUBACK:      u8 = 4;
+// const PUBREC:      u8 = 5;
+// const PUBREL:      u8 = 6;
+// const PUBCOMP:     u8 = 7;
+// const SUBSCRIBE:   u8 = 8;
+// const SUBACK:      u8 = 9;
+// const UNSUBSCRIBE: u8 = 10;
+// const UNSUBACK:    u8 = 11;
+// const PINGREQ:     u8 = 12;
+// const PINGRESP:    u8 = 13;
+// const DISCONNECT:  u8 = 14;
 
+#[derive(Debug)]
 struct FixedHeader {
     control_packet_type: u8,
 
@@ -57,7 +60,7 @@ impl FixedHeader {
     }
 
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
-        writer.write_u8((self.control_packet_type << 4) & 0xF);
+        writer.write_u8(self.control_packet_type << 4)?;
         let mut cur_len = self.remaining_length;
         loop {
             let mut byte = (cur_len & 0x7F) as u8;
@@ -78,6 +81,31 @@ impl FixedHeader {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::CONNECT;
+    use crate::FixedHeader;
+
+    #[test]
+    fn test_fix_header_write() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut header = FixedHeader::new(CONNECT, 0);
+        assert!(header.write(&mut buf).is_ok());
+
+        assert_eq!(buf.len(), 2, "check buffer length");
+        assert_eq!(buf[0] >> 4, CONNECT, "check control packet type");
+        assert_eq!(buf[1], 0, "check remaining length");
+
+        buf.clear();
+        header.remaining_length = 0x17;
+        assert!(header.write(&mut buf).is_ok());
+        assert_eq!(buf.len(), 2, "check buffer length");
+        assert_eq!(buf[0] >> 4, CONNECT, "check control packet type");
+        assert_eq!(buf[1], 0x17, "check remaining length")
+    }
+}
+
+#[derive(Debug)]
 pub struct ConnectFlags {
     pub user_name: bool,
     pub password: bool,
@@ -97,12 +125,34 @@ impl ConnectFlags {
             will_retain: false,
             will_qos: 0,
             will_flag: false,
-            clean_session: false,
+            clean_session: true,
             reserved: false
         }
     }
+
+    pub fn write<W: Write>(&self, writer: &mut W)  -> Result<(), io::Error> {
+        let mut val: u8 = 0;
+        if self.clean_session {
+            val |= 0x1 << 1;
+        }
+        if self.will_flag {
+            val |= 0x1 << 2;
+            val |= self.will_qos << 3;
+        }
+        if self.will_retain {
+            val |= 0x1 << 5;
+        }
+        if self.password {
+            val |= 0x1 << 6;
+        }
+        if self.user_name {
+            val |= 0x1 << 7;
+        }
+        writer.write_u8(val)
+    }
 }
 
+#[derive(Debug)]
 struct ConnectPacketPayload {
     client_identifier: String,
 }
@@ -114,12 +164,18 @@ impl ConnectPacketPayload {
         }
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
-        writer.write_all(self.client_identifier.as_bytes());
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
+        writer.write_u16::<BigEndian>(self.client_identifier.as_bytes().len() as u16)?;
+        writer.write_all(self.client_identifier.as_bytes())?;        
         Ok(())
+    }
+
+    pub fn byte_length(&self) -> u32 {
+        return 2 + self.client_identifier.as_bytes().len() as u32;
     }
 }
 
+#[derive(Debug)]
 struct ConnectPacket {
     fixed_header: FixedHeader,
 
@@ -134,22 +190,35 @@ struct ConnectPacket {
 
 impl ConnectPacket {
     pub fn new(client_identifier: String) -> ConnectPacket {
-        ConnectPacket {
+        let mut packet = ConnectPacket {
             fixed_header: FixedHeader::new(CONNECT, 0),
             protocol_name: [0x0, 0x4, b'M', b'Q', b'T', b'T'],
             protocol_level: 0x04, // spefifying MQTT 3.1.1
             flags: ConnectFlags::new(),
-            keep_alive: 0,
+            keep_alive: 60,
             payload: ConnectPacketPayload::new(client_identifier),
-        }
+        };
+
+        packet.update_remaining_length();
+        packet
     }
+
     pub fn wirte<W: Write>(&self, writer: &mut W) -> Result<(), io::Error> {
-        self.fixed_header.write(writer);
-        writer.write_all(&self.protocol_name);
+        self.fixed_header.write(writer)?;
+        writer.write_all(&self.protocol_name)?;
+        writer.write_u8(self.protocol_level)?;
+        self.flags.write(writer)?;
+        writer.write_u16::<BigEndian>(self.keep_alive)?;
+        self.payload.write(writer)?;
         Ok(())
+    }
+
+    fn update_remaining_length(&mut self) {
+        self.fixed_header.remaining_length = 10 /* Variable Header Length */ + self.payload.byte_length()
     }
 }
 
+#[derive(Debug)]
 struct ConnackFlags {
     session_present: bool,
 }
@@ -167,6 +236,7 @@ impl ConnackFlags {
     }
 }
 
+#[derive(Debug)]
 struct ConnackPacket {
     fixed_header: FixedHeader,
     flags: ConnackFlags,
@@ -188,19 +258,25 @@ impl ConnackPacket {
 }
 
 fn main() {
+    env_logger::init();
+
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1883);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(30)).expect("failed to connect");
-    stream.set_read_timeout(Some(Duration::from_secs(3)));
-    stream.set_write_timeout(Some(Duration::from_secs(3)));
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
 
     let connect_packet = ConnectPacket::new("test-client".to_string());
-    connect_packet.wirte(&mut stream);
+    debug!("{}", format!("connect_packet: {:?}", connect_packet));
+    match &connect_packet.wirte(&mut stream) {
+        Err(err) => error!("write error: {}", err),
+        _ => (),
+    }
 
     let mut reader = BufReader::new(&stream);
     let result = ConnackPacket::read(&mut reader);
 
     match &result {
-        Ok(connack_packet) => println!("CONNACK ret code: {}", connack_packet.ret_code),
-        Err(err) => println!("error: {}", err.to_string()),        
+        Ok(connack_packet) => debug!("connack_packet: {:?}", connack_packet),
+        Err(err) => error!("read error: {}", err.to_string()),        
     }
 }
