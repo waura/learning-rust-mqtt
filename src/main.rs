@@ -37,7 +37,7 @@ impl FixedHeader {
     }
 
     pub fn read<R: Read>(reader: &mut R) -> Result<FixedHeader, io::Error> {
-        let control_packet_type = reader.read_u8()?;
+        let control_packet_type = (reader.read_u8()? & 0xF0) >> 4;
         let remaining_length = {
             let mut cur = 0u32;
             for i in 0.. {
